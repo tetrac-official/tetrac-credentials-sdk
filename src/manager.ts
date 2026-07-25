@@ -73,10 +73,14 @@ const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function assertSafeSegment(kind: string, value: string): void {
   // eslint-disable-next-line no-control-regex -- control chars are exactly what we screen out.
   if (/[\x00-\x1f\x7f]/.test(value)) {
-    throw new CredentialSchemaError(`Schema ${kind} must not contain control characters.`);
+    throw new CredentialSchemaError(
+      `Schema ${kind} must not contain control characters.`,
+    );
   }
   if (RESERVED_KEYS.has(value)) {
-    throw new CredentialSchemaError(`Schema ${kind} must not be a reserved object key ("${value}").`);
+    throw new CredentialSchemaError(
+      `Schema ${kind} must not be a reserved object key ("${value}").`,
+    );
   }
 }
 
@@ -122,7 +126,10 @@ function validateSet(schema: CredentialSchema, set: CredentialValues): void {
  * Split a validated single set into its plaintext (index) and secret (blob) halves,
  * per the schema's `secret` flags. Omitted optional fields are simply dropped.
  */
-function splitSet(schema: CredentialSchema, set: CredentialValues): {
+function splitSet(
+  schema: CredentialSchema,
+  set: CredentialValues,
+): {
   publicFields: Record<string, string>;
   secretFields: Record<string, string>;
 } {
@@ -148,7 +155,9 @@ function splitSet(schema: CredentialSchema, set: CredentialValues): {
  * Construct the credential manager. The app injects the vault accessors (§4); the SDK
  * holds no key of its own. Returns the public {@link CredentialManager} surface.
  */
-export function createCredentialManager(config: CredentialManagerConfig): CredentialManager {
+export function createCredentialManager(
+  config: CredentialManagerConfig,
+): CredentialManager {
   // Reads the vault app key (null when locked). Injected — never owned here.
   const getAppKey = config.getAppKey;
   // Reads the current account identity (null when logged out). Scopes storage + cache.
@@ -169,11 +178,23 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
   const clearEpochs = new Map<string, number>();
   // Read the current clear epoch for a namespace (0 if never cleared).
   const clearEpoch = (ns: string): number => clearEpochs.get(ns) ?? 0;
+  // Per-namespace monotonic "write generation": bumped after every COMMITTED set/remove. A
+  // getCredentials snapshots it before its decrypt await and refuses to warm the cache if it
+  // changed — so a read that decrypted a now-superseded ciphertext can't clobber the fresher value
+  // a concurrent write just cached (read-after-write staleness). Unlike clearEpoch this NEVER aborts
+  // a write; it only gates the racing READER's own cache write, so concurrent writes are unaffected.
+  const writeGens = new Map<string, number>();
+  const writeGen = (ns: string): number => writeGens.get(ns) ?? 0;
+  const bumpWriteGen = (ns: string): void =>
+    void writeGens.set(ns, writeGen(ns) + 1);
 
   /**
    * Serialize a mutating operation per namespace (read-modify-write on one shared blob).
    */
-  function withNamespaceLock<T>(namespace: string, task: () => Promise<T>): Promise<T> {
+  function withNamespaceLock<T>(
+    namespace: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
     // The previous operation on this namespace (or an already-resolved promise).
     const prev = writeTails.get(namespace) ?? Promise.resolve();
     // Chain our task after it, running regardless of whether prev resolved or rejected.
@@ -225,7 +246,10 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     // Read the injected identity.
     const identity = getIdentity();
     // No identity → nothing to scope to; behave as locked rather than writing global blobs.
-    if (identity === null) throw new VaultLockedError("No identity: log in before accessing credentials.");
+    if (identity === null)
+      throw new VaultLockedError(
+        "No identity: log in before accessing credentials.",
+      );
     // Present.
     return identity;
   }
@@ -233,13 +257,21 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
   /**
    * Read + decrypt a namespace's secret blob for an identity. Empty object if absent.
    */
-  async function readBlob(appKey: string, namespace: string, identity: string): Promise<SecretBlob> {
+  async function readBlob(
+    appKey: string,
+    namespace: string,
+    identity: string,
+  ): Promise<SecretBlob> {
     // Fetch the raw ciphertext.
     const raw = readSecretsRaw(storage, prefix, namespace, identity);
     // Nothing stored yet → empty blob.
     if (!raw) return {};
     // Decrypt under the app key, AAD-bound to this exact slot.
-    const json = await decryptString(appKey, raw, secretsAad(prefix, namespace, identity));
+    const json = await decryptString(
+      appKey,
+      raw,
+      secretsAad(prefix, namespace, identity),
+    );
     // Parse the recovered JSON.
     const parsed = JSON.parse(json) as unknown;
     // Guard the shape before trusting it as a blob.
@@ -252,18 +284,31 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
    * from the synchronous {@link commitBlob} lets a caller run its final commit await-free — so a
    * synchronous `clearNamespace` can't interleave between the encrypt and the store (F-audit).
    */
-  async function encryptBlob(appKey: string, namespace: string, identity: string, blob: SecretBlob): Promise<string | null> {
+  async function encryptBlob(
+    appKey: string,
+    namespace: string,
+    identity: string,
+    blob: SecretBlob,
+  ): Promise<string | null> {
     // An empty blob means "no secrets left" — signal deletion rather than encrypting "{}".
     if (Object.keys(blob).length === 0) return null;
     // Serialize + encrypt the blob, AAD-bound to this slot.
-    return encryptString(appKey, JSON.stringify(blob), secretsAad(prefix, namespace, identity));
+    return encryptString(
+      appKey,
+      JSON.stringify(blob),
+      secretsAad(prefix, namespace, identity),
+    );
   }
 
   /**
    * Synchronously persist an already-encrypted blob (or delete the key when `cipher` is null).
    * Await-free by design: callers invoke it only after the last await, inside a clear-epoch guard.
    */
-  function commitBlob(namespace: string, identity: string, cipher: string | null): void {
+  function commitBlob(
+    namespace: string,
+    identity: string,
+    cipher: string | null,
+  ): void {
     if (cipher === null) removeSecrets(storage, prefix, namespace, identity);
     else writeSecretsRaw(storage, prefix, namespace, identity, cipher);
   }
@@ -276,7 +321,9 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
   function registerCredentialSchema(schema: CredentialSchema): void {
     // Basic structural validation — a malformed schema is a programming error.
     if (!schema.ref || !schema.ref.namespace || !schema.ref.providerId) {
-      throw new CredentialSchemaError("Schema.ref must have a non-empty namespace and providerId.");
+      throw new CredentialSchemaError(
+        "Schema.ref must have a non-empty namespace and providerId.",
+      );
     }
     // Screen out control characters so every downstream key derivation stays unambiguous.
     assertSafeSegment("namespace", schema.ref.namespace);
@@ -319,19 +366,35 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
   /**
    * Encrypt secrets + write non-secrets to the index. Requires an unlocked vault.
    */
-  function setCredentials(ref: CredentialRef, values: CredentialInput): Promise<void> {
+  function setCredentials(
+    ref: CredentialRef,
+    values: CredentialInput,
+  ): Promise<void> {
     // Snapshot the clear epoch NOW, synchronously at call time — before this write is even queued.
     // If a clearNamespace bumps it before we commit, we abort so the clear wins (no resurrection).
     const startEpoch = clearEpoch(ref.namespace);
+    // Bind this write to the account + app key active NOW (synchronously), not to whatever the vault
+    // holds when the microtask-deferred task body finally runs. withNamespaceLock defers the task, so
+    // an account switch (or key rotation) between this call and the task would otherwise redirect the
+    // write to a DIFFERENT account's storage slot, or encrypt it under the wrong key. The null-checks
+    // stay INSIDE the task so a locked/logged-out vault surfaces as a promise REJECTION, never a
+    // synchronous throw (uniform async error handling).
+    const callIdentity = getIdentity();
+    const callAppKey = getAppKey();
     // Serialize the whole read-modify-write against this namespace's blob. EVERY error path —
     // including the unregistered-schema check — lives INSIDE the returned promise, so all failures
     // surface as promise REJECTIONS, never a synchronous throw (uniform async error handling).
     return withNamespaceLock(ref.namespace, async () => {
       // Resolve the schema (rejects if unregistered).
       const schema = requireSchema(ref);
-      // Require an unlocked vault + a scoping identity.
-      const appKey = requireAppKey();
-      const identity = requireIdentity();
+      // Enforce the unlocked-vault + identity contract on the CALL-TIME snapshot (async rejection).
+      if (callAppKey === null) throw new VaultLockedError();
+      if (callIdentity === null)
+        throw new VaultLockedError(
+          "No identity: log in before accessing credentials.",
+        );
+      const appKey = callAppKey;
+      const identity = callIdentity;
       // Load the existing decrypted blob (to preserve OTHER providers in this namespace).
       const blob = await readBlob(appKey, namespace(ref), identity);
       // Load the existing plaintext index.
@@ -359,7 +422,12 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
           // Store all sets (full field bodies) in the encrypted blob.
           blob[ref.providerId] = values;
           // Index tracks only count + timestamp for multi (no per-set plaintext rendering).
-          index[ref.providerId] = { publicFields: {}, secretKeys: [], updatedAt: Date.now(), count: values.length };
+          index[ref.providerId] = {
+            publicFields: {},
+            secretKeys: [],
+            updatedAt: Date.now(),
+            count: values.length,
+          };
           // Cache the array as-is.
           cacheValue = values;
         }
@@ -397,10 +465,22 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
       // Persist the re-encrypted blob and the updated index.
       commitBlob(namespace(ref), identity, cipher);
       writeIndex(storage, prefix, namespace(ref), identity, index);
+      // Signal the committed write so any getCredentials currently parked on a decrypt await for
+      // this namespace won't re-warm the cache with the value it read BEFORE this commit.
+      bumpWriteGen(ref.namespace);
 
-      // Update the session cache: warm it for a present, cacheable credential; otherwise drop
-      // any stale entry (non-cacheable schema, or an empty multi cleared above → cacheValue null).
-      if (isCacheable(schema) && cacheValue !== null) cache.write(ref, cacheValue);
+      // Update the session cache: warm it for a present, cacheable credential; otherwise drop any
+      // stale entry (non-cacheable schema, or an empty multi cleared above → cacheValue null).
+      // Guard on identity: if an account switch landed during our crypto awaits, getIdentity() now
+      // names a DIFFERENT account and cache.write would file THIS account's plaintext under it — a
+      // cross-identity leak. The storage commit above is still correct (it used the captured
+      // `identity`); we simply refuse to cache under the wrong account.
+      if (
+        isCacheable(schema) &&
+        cacheValue !== null &&
+        getIdentity() === identity
+      )
+        cache.write(ref, cacheValue);
       else cache.invalidate(ref);
     });
   }
@@ -420,9 +500,12 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     // Cache miss (or non-cacheable): require an unlocked vault + identity.
     const appKey = requireAppKey();
     const identity = requireIdentity();
-    // Snapshot the clear epoch BEFORE the decrypt await, so a clearNamespace landing mid-read
-    // can't re-warm the cache with (or return) a value for a namespace it just wiped. (F-10.)
+    // Snapshot the clear epoch AND the write generation BEFORE the decrypt await: a clearNamespace
+    // landing mid-read must not re-warm the cache for a wiped namespace (F-10), and a concurrent
+    // set/remove that COMMITS mid-read must not have its fresh cache entry clobbered by the value we
+    // read before it committed (read-after-write staleness).
     const startEpoch = clearEpoch(ref.namespace);
+    const startGen = writeGen(ref.namespace);
     // Read the plaintext index for this namespace.
     const index = readIndex(storage, prefix, namespace(ref), identity);
     // The index entry for this provider (undefined → unconfigured).
@@ -434,6 +517,11 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     // A clearNamespace ran during the decrypt await → the namespace is gone; honor the clear:
     // don't warm the cache, and report unconfigured rather than a resurrected secret.
     if (clearEpoch(ref.namespace) !== startEpoch) return null;
+    // An account switch landed during the decrypt await → this decrypted value belongs to the
+    // PREVIOUS identity. Returning or caching it now would hand one account's secret to another
+    // (the switch's lock signal already wiped the previous identity's cache submap). Report
+    // unconfigured for the new account rather than leaking.
+    if (getIdentity() !== identity) return null;
     const secretPart = blob[ref.providerId];
 
     // Assemble the output shape per single vs multi.
@@ -441,7 +529,8 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     if (schema.multi) {
       // Multi: the data IS the array of sets in the blob. An absent OR empty list reads back as
       // null so has()/get() agree (F-6) — a defensive mirror of the clear-on-empty set path.
-      output = Array.isArray(secretPart) && secretPart.length > 0 ? secretPart : null;
+      output =
+        Array.isArray(secretPart) && secretPart.length > 0 ? secretPart : null;
     } else {
       // Single: merge plaintext (index) with decrypted secrets (blob). Defense-in-depth (F-12):
       // a schema-declared SECRET field must only ever be sourced from the AUTHENTICATED blob, never
@@ -449,18 +538,29 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
       // secret field into the index, so this filter is a no-op for untampered data — it strips only
       // a secret-named key that an at-rest tamperer planted in the index to forge that field's value
       // (e.g. an optional secret the blob doesn't hold). Non-secret index fields are unaffected.
-      const secretDeclared = new Set(schema.fields.filter((f) => f.secret).map((f) => f.key));
+      const secretDeclared = new Set(
+        schema.fields.filter((f) => f.secret).map((f) => f.key),
+      );
       const publicOnly: Record<string, string> = {};
       for (const [key, value] of Object.entries(entry.publicFields)) {
         if (!secretDeclared.has(key)) publicOnly[key] = value;
       }
       // Decrypted secret half (authenticated); spread LAST so it always wins over any index value.
-      const secrets = secretPart && !Array.isArray(secretPart) ? secretPart : {};
+      const secrets =
+        secretPart && !Array.isArray(secretPart) ? secretPart : {};
       output = { ...publicOnly, ...secrets };
     }
 
-    // Warm the cache for cacheable schemas so subsequent reads survive the auto-lock.
-    if (output !== null && isCacheable(schema)) cache.write(ref, output);
+    // Warm the cache for cacheable schemas so subsequent reads survive the auto-lock — but ONLY if
+    // no set/remove committed for this namespace during our decrypt await. If one did, our decrypted
+    // `output` may reflect the pre-write ciphertext; caching it would overwrite the fresher value the
+    // writer already cached. Skip the warm (the next read re-decrypts) rather than persist staleness.
+    if (
+      output !== null &&
+      isCacheable(schema) &&
+      writeGen(ref.namespace) === startGen
+    )
+      cache.write(ref, output);
     // Hand back the decrypted view.
     return output;
   }
@@ -473,7 +573,9 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     const identity = getIdentity();
     if (identity === null) return false;
     // Read the plaintext index and look up this provider.
-    const entry = readIndex(storage, prefix, ref.namespace, identity)[ref.providerId];
+    const entry = readIndex(storage, prefix, ref.namespace, identity)[
+      ref.providerId
+    ];
     // Present, and (for multi) holding at least one set.
     return !!entry && (entry.count === undefined || entry.count > 0);
   }
@@ -503,9 +605,15 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     const identity = getIdentity();
     if (identity === null) return null;
     // Look up the index entry.
-    const entry = readIndex(storage, prefix, ref.namespace, identity)[ref.providerId];
-    // Not configured, or an empty (count:0) multi entry → null, matching has()/get(). (F-6 hardening.)
-    if (!entry || entry.count === 0) return null;
+    const entry = readIndex(storage, prefix, ref.namespace, identity)[
+      ref.providerId
+    ];
+    // Not configured, or a non-positive-count multi entry → null, matching has()/list()'s `count>0`
+    // presence test. getSummary previously gated only on `count===0`, so it disagreed with has/list
+    // for a tampered negative/NaN count; isValidEntry now drops those at the storage gate, and this
+    // predicate keeps summary in lock-step for any legacy count that slips through. (F-6 hardening.)
+    if (!entry || (entry.count !== undefined && !(entry.count > 0)))
+      return null;
     // The registered schema (if any) lets us name multi fields; single derives from the entry.
     const schema = schemas.get(schemaMapKey(ref));
     // Field names present: multi uses the schema's declared keys; single uses index data.
@@ -523,11 +631,20 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
   function removeCredentials(ref: CredentialRef): Promise<void> {
     // Snapshot the clear epoch synchronously (see setCredentials) so a mid-flight clear wins.
     const startEpoch = clearEpoch(ref.namespace);
+    // Bind the removal to the CALL-TIME account + key (see setCredentials): the deferred task must
+    // rewrite THIS account's blob under THIS account's key, even if a switch lands before it runs.
+    const callIdentity = getIdentity();
+    const callAppKey = getAppKey();
     // Serialize against other writes to this namespace's blob.
     return withNamespaceLock(ref.namespace, async () => {
-      // Require an unlocked vault + identity to rewrite the blob.
-      const appKey = requireAppKey();
-      const identity = requireIdentity();
+      // Enforce the unlocked-vault + identity contract on the CALL-TIME snapshot (async rejection).
+      if (callAppKey === null) throw new VaultLockedError();
+      if (callIdentity === null)
+        throw new VaultLockedError(
+          "No identity: log in before accessing credentials.",
+        );
+      const appKey = callAppKey;
+      const identity = callIdentity;
       // Load the current index.
       const index = readIndex(storage, prefix, namespace(ref), identity);
       // Load + decrypt the current blob.
@@ -544,6 +661,9 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
       // Persist the (possibly now-empty) blob and index.
       commitBlob(namespace(ref), identity, cipher);
       writeIndex(storage, prefix, namespace(ref), identity, index);
+      // Signal the committed write so a getCredentials parked on a decrypt await for this namespace
+      // won't re-warm the cache with the value it read before this removal.
+      bumpWriteGen(ref.namespace);
       // Evict any cached decrypted copy.
       cache.invalidate(ref);
     });
@@ -557,7 +677,8 @@ export function createCredentialManager(config: CredentialManagerConfig): Creden
     // the change when it resumes and refuse to re-persist this namespace (no resurrection).
     clearEpochs.set(ns, clearEpoch(ns) + 1);
     // Enumerate + remove every storage key under this namespace (all identities).
-    for (const key of namespaceKeys(storage, prefix, ns)) storage.removeItem(key);
+    for (const key of namespaceKeys(storage, prefix, ns))
+      storage.removeItem(key);
     // Drop the namespace's cached decrypted values too.
     cache.invalidateNamespace(ns);
   }

@@ -1,6 +1,6 @@
 {
   "name": "@tetrac/credentials-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Universal, provider-agnostic API-credential store and decrypted-key session handler. Zero runtime deps; the vault app key and lock signals are injected by the host app.",
   "type": "module",
   "sideEffects": false,

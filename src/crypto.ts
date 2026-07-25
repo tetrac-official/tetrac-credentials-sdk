@@ -19,8 +19,12 @@ const KDF_DOMAIN = "tetrac-credentials-sdk:aes-256-gcm:v1:";
 const IV_LENGTH = 12;
 
 // Reused text codecs (allocating once is cheaper than per-call).
+// ignoreBOM:true is REQUIRED for a lossless round-trip: the default decoder consumes a leading
+// U+FEFF (BOM / zero-width no-break space), so decryptString would silently drop it and return a
+// string shorter than the plaintext encryptString was given. AES-GCM authenticates the bytes fine;
+// the corruption is purely in the UTF-8 → string decode. ignoreBOM keeps the BOM as a normal code point.
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /**
  * Encode a string to UTF-8 bytes backed by a plain ArrayBuffer. `TextEncoder.encode`
@@ -41,7 +45,9 @@ function getSubtle(): SubtleCrypto {
   const cryptoObj = (globalThis as { crypto?: Crypto }).crypto;
   // Bail loudly rather than dereferencing undefined downstream.
   if (!cryptoObj?.subtle) {
-    throw new Error("WebCrypto (globalThis.crypto.subtle) is unavailable in this runtime.");
+    throw new Error(
+      "WebCrypto (globalThis.crypto.subtle) is unavailable in this runtime.",
+    );
   }
   // The SubtleCrypto instance used for all AES-GCM operations.
   return cryptoObj.subtle;
@@ -76,7 +82,10 @@ async function deriveAesKey(appKey: string): Promise<CryptoKey> {
   // Hash the domain-separated app key down to a fixed 32-byte digest.
   const digest = await subtle.digest("SHA-256", utf8(KDF_DOMAIN + appKey));
   // Import those 32 bytes as a non-extractable AES-GCM key usable for encrypt+decrypt.
-  return subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  return subtle.importKey("raw", digest, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
 }
 
 /**
@@ -118,7 +127,11 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
  * `aad` (additional authenticated data) binds the ciphertext to its logical slot
  * (namespace+identity): a blob copied into a different slot fails authentication.
  */
-export async function encryptString(appKey: string, plaintext: string, aad: string): Promise<string> {
+export async function encryptString(
+  appKey: string,
+  plaintext: string,
+  aad: string,
+): Promise<string> {
   // The SubtleCrypto instance.
   const subtle = getSubtle();
   // Derive the per-app-key AES key.
@@ -149,7 +162,11 @@ export async function encryptString(appKey: string, plaintext: string, aad: stri
  * Decrypt an envelope produced by `encryptString`, using the same app key and AAD.
  * Throws if the version is unknown or authentication fails (wrong key/AAD/tampering).
  */
-export async function decryptString(appKey: string, envelopeB64: string, aad: string): Promise<string> {
+export async function decryptString(
+  appKey: string,
+  envelopeB64: string,
+  aad: string,
+): Promise<string> {
   // The SubtleCrypto instance.
   const subtle = getSubtle();
   // Decode the base64 envelope back to bytes.
@@ -160,7 +177,9 @@ export async function decryptString(appKey: string, envelopeB64: string, aad: st
   }
   // Byte 0 must be a version we understand.
   if (envelope[0] !== ENVELOPE_VERSION) {
-    throw new Error(`Unsupported credential ciphertext version: ${envelope[0]}.`);
+    throw new Error(
+      `Unsupported credential ciphertext version: ${envelope[0]}.`,
+    );
   }
   // Extract the IV (bytes 1..12).
   const iv = envelope.subarray(1, 1 + IV_LENGTH);

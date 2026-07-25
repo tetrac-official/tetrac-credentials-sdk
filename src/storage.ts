@@ -28,7 +28,10 @@ export type NamespaceIndex = Record<string, IndexEntry>;
  * The decrypted secret blob for a namespace: providerId → secret values (single) or
  * an array of full value-sets (multi). This is what gets AES-GCM encrypted at rest.
  */
-export type SecretBlob = Record<string, Record<string, string> | Record<string, string>[]>;
+export type SecretBlob = Record<
+  string,
+  Record<string, string> | Record<string, string>[]
+>;
 
 /**
  * Resolve the storage backend: an explicitly injected one, else `globalThis.localStorage`.
@@ -41,7 +44,9 @@ export function resolveStorage(injected: StorageLike | undefined): StorageLike {
   const ls = (globalThis as { localStorage?: StorageLike }).localStorage;
   if (ls) return ls;
   // Nothing to persist to — fail loudly at construction time.
-  throw new Error("No storage available: inject `storage` or run where localStorage exists.");
+  throw new Error(
+    "No storage available: inject `storage` or run where localStorage exists.",
+  );
 }
 
 /**
@@ -60,7 +65,11 @@ function seg(value: string): string {
  * Storage key for a namespace's ENCRYPTED secret blob, scoped to an identity.
  * Shape: `${prefix}:${enc(namespace)}:secrets:${enc(identity)}`.
  */
-export function secretsKey(prefix: string, namespace: string, identity: string): string {
+export function secretsKey(
+  prefix: string,
+  namespace: string,
+  identity: string,
+): string {
   return `${prefix}:${seg(namespace)}:secrets:${seg(identity)}`;
 }
 
@@ -68,7 +77,11 @@ export function secretsKey(prefix: string, namespace: string, identity: string):
  * Storage key for a namespace's PLAINTEXT index, scoped to an identity.
  * Shape: `${prefix}:${enc(namespace)}:index:${enc(identity)}`.
  */
-export function indexKey(prefix: string, namespace: string, identity: string): string {
+export function indexKey(
+  prefix: string,
+  namespace: string,
+  identity: string,
+): string {
   return `${prefix}:${seg(namespace)}:index:${seg(identity)}`;
 }
 
@@ -76,7 +89,11 @@ export function indexKey(prefix: string, namespace: string, identity: string): s
  * The AAD string that binds a secret blob to its slot (passed to AES-GCM). Any blob
  * moved to a different namespace/identity slot will fail authentication on decrypt.
  */
-export function secretsAad(prefix: string, namespace: string, identity: string): string {
+export function secretsAad(
+  prefix: string,
+  namespace: string,
+  identity: string,
+): string {
   return secretsKey(prefix, namespace, identity);
 }
 
@@ -94,17 +111,46 @@ export function secretsAad(prefix: string, namespace: string, identity: string):
  */
 function isValidEntry(value: unknown): value is IndexEntry {
   // Must be a plain (non-null, non-array) object.
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
   const entry = value as Record<string, unknown>;
   // publicFields must itself be a plain object (we spread it into the merged output).
   const publicFields = entry.publicFields;
-  if (typeof publicFields !== "object" || publicFields === null || Array.isArray(publicFields)) return false;
+  if (
+    typeof publicFields !== "object" ||
+    publicFields === null ||
+    Array.isArray(publicFields)
+  )
+    return false;
   // secretKeys must be an array (getSummary spreads it).
   if (!Array.isArray(entry.secretKeys)) return false;
-  // updatedAt must be a number; count, when present, must be a number.
+  // updatedAt must be a number; count, when present, must be a NON-NEGATIVE INTEGER.
+  // The write path only ever emits count>=1 (empty multi → the provider is deleted, not
+  // stored with count 0). Admitting a negative / NaN / Infinity / fractional count here would
+  // let an at-rest tamperer split the lock-free probes: has/list gate on `count>0` (absent for
+  // -1/NaN) while getSummary historically gated on `count===0` (present for -1/NaN). Requiring a
+  // clean non-negative integer at the storage gate keeps the three probes provably in agreement.
   if (typeof entry.updatedAt !== "number") return false;
-  if (entry.count !== undefined && typeof entry.count !== "number") return false;
+  const count = entry.count;
+  if (
+    count !== undefined &&
+    (typeof count !== "number" || !Number.isInteger(count) || count < 0)
+  )
+    return false;
   return true;
+}
+
+/**
+ * A fresh, PROTOTYPE-LESS index object. Every readIndex return path uses this (not a `{}` literal)
+ * so a lookup by a providerId that happens to equal an Object.prototype member name ("toString",
+ * "valueOf", "constructor", "hasOwnProperty", …) resolves to `undefined` — never an inherited
+ * function. Without this the lock-free probes fail OPEN on an ABSENT/CORRUPT index:
+ * `hasCredentials({providerId:"toString"})` would read `Object.prototype.toString` and report a
+ * phantom credential as present, and `getSummary`/`getCredentials` would throw a `TypeError`
+ * (`Object.keys(<function>.publicFields)`) instead of reporting "unconfigured". (R-audit F-11 read-path.)
+ */
+function emptyIndex(): NamespaceIndex {
+  return Object.create(null) as NamespaceIndex;
 }
 
 /**
@@ -113,21 +159,27 @@ function isValidEntry(value: unknown): value is IndexEntry {
  * entries that fail {@link isValidEntry} are dropped so the lock-free probes stay fail-safe
  * against a tampered/corrupt entry (F-11).
  */
-export function readIndex(storage: StorageLike, prefix: string, namespace: string, identity: string): NamespaceIndex {
+export function readIndex(
+  storage: StorageLike,
+  prefix: string,
+  namespace: string,
+  identity: string,
+): NamespaceIndex {
   // Look up the raw JSON string.
   const raw = storage.getItem(indexKey(prefix, namespace, identity));
-  // No entry → empty index.
-  if (!raw) return {};
+  // No entry → empty index (null-proto, so a "toString"-style providerId can't alias a prototype member).
+  if (!raw) return emptyIndex();
   try {
     // Parse the stored JSON into an index object.
     const parsed = JSON.parse(raw) as unknown;
     // Only a plain (non-array) object is a usable index; anything else → nothing configured.
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return emptyIndex();
     // Copy through a NULL-PROTOTYPE object so a literal "__proto__"/"constructor" key produced by
     // JSON.parse can never reach Object.prototype during the copy (the `clean[key] = …` write below
     // would otherwise hit the __proto__ setter), and keep only well-formed entries so a tampered or
     // corrupt entry can't crash or mislead the lock-free probes. (F-11.)
-    const clean: NamespaceIndex = Object.create(null) as NamespaceIndex;
+    const clean = emptyIndex();
     for (const key of Object.keys(parsed as Record<string, unknown>)) {
       const entry = (parsed as Record<string, unknown>)[key];
       if (isValidEntry(entry)) clean[key] = entry;
@@ -135,7 +187,7 @@ export function readIndex(storage: StorageLike, prefix: string, namespace: strin
     return clean;
   } catch {
     // Malformed JSON → treat as unconfigured rather than crashing a render path.
-    return {};
+    return emptyIndex();
   }
 }
 
@@ -165,7 +217,12 @@ export function writeIndex(
  * Read the RAW (still-encrypted) secret blob string for a namespace, or null if absent.
  * Decryption happens in the manager (it owns the app key); storage stays crypto-free.
  */
-export function readSecretsRaw(storage: StorageLike, prefix: string, namespace: string, identity: string): string | null {
+export function readSecretsRaw(
+  storage: StorageLike,
+  prefix: string,
+  namespace: string,
+  identity: string,
+): string | null {
   return storage.getItem(secretsKey(prefix, namespace, identity));
 }
 
@@ -185,7 +242,12 @@ export function writeSecretsRaw(
 /**
  * Delete a namespace's secret blob for one identity (used when it becomes empty).
  */
-export function removeSecrets(storage: StorageLike, prefix: string, namespace: string, identity: string): void {
+export function removeSecrets(
+  storage: StorageLike,
+  prefix: string,
+  namespace: string,
+  identity: string,
+): void {
   storage.removeItem(secretsKey(prefix, namespace, identity));
 }
 
@@ -194,7 +256,11 @@ export function removeSecrets(storage: StorageLike, prefix: string, namespace: s
  * `clearNamespace`, the explicit "nuke this bucket" action. Matches both the secrets
  * and index keys via the `${prefix}:${namespace}:` prefix.
  */
-export function namespaceKeys(storage: StorageLike, prefix: string, namespace: string): string[] {
+export function namespaceKeys(
+  storage: StorageLike,
+  prefix: string,
+  namespace: string,
+): string[] {
   // The shared prefix for every key in this namespace, any identity. The namespace is
   // encoded exactly as the key builders encode it, so a `:` in a hierarchical namespace
   // (e.g. "a:b") can't make clearNamespace("a") over-match its siblings (R-audit F-4).
