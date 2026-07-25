@@ -4,8 +4,7 @@
   "description": "Universal, provider-agnostic API-credential store and decrypted-key session handler. Zero runtime deps; the vault app key and lock signals are injected by the host app.",
   "type": "module",
   "sideEffects": false,
-  "license": "UNLICENSED",
-  "private": true,
+   "license": "MIT",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
