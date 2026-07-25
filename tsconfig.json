@@ -1,0 +1,35 @@
+{
+  // TypeScript configuration for the credentials SDK.
+  // Targets a modern runtime so the platform WebCrypto (globalThis.crypto.subtle),
+  // TextEncoder/TextDecoder and btoa/atob are all available with no polyfills.
+  "compilerOptions": {
+    // Emit modern JS; the bundler (tsup) down-levels/duplicates to ESM+CJS.
+    "target": "ES2022",
+    // Library surface: standard JS + DOM types (WebCrypto, TextEncoder, atob/btoa, Storage).
+    "lib": ["ES2022", "DOM"],
+    // Author in ESM; tsup produces both ESM and CJS artifacts.
+    "module": "ESNext",
+    // Resolve bare specifiers the modern way (respects the "exports" map).
+    "moduleResolution": "Bundler",
+    // Interop niceties for default imports and JSON.
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    // Strictness — this is a keys/signing-adjacent codebase; catch everything.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    // Type-check only via `tsc --noEmit`; tsup owns the actual build output.
+    "noEmit": true,
+    "declaration": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true
+  },
+  // Type-check the SDK source and its tests.
+  "include": ["src", "tests", "tsup.config.ts"]
+}
