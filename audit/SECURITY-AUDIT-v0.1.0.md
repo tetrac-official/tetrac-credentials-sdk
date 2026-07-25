@@ -119,6 +119,63 @@ The clear always wins; the racing write/read aborts instead of resurrecting.
 
 ---
 
+### F-11 — Malformed index *entry* crashes `getSummary` / mis-reports probes · **Low · FIXED**
+
+**Location:** `src/storage.ts` (`readIndex`); observed in `src/manager.ts` (`getSummary`, `hasCredentials`, `listProviders`).
+
+*Surfaced by the pass-3 re-audit.* `readIndex` validated only that the **top-level** parsed value was an object; it trusted each per-provider **entry** verbatim. The plaintext index is unauthenticated and app-writable (adversary #1 can tamper it; ordinary corruption can mangle it), and it backs the **lock-free** probes. A well-formed index object whose *entry* is malformed — `{"p":42}`, `{"p":null}`, `{"p":[…]}`, `{"p":{}}` (missing `publicFields`), or an entry missing `secretKeys` — reached the probes and broke them:
+
+**Proof (pre-fix):**
+```
+index = {"venue-x":{"publicFields":{},"updatedAt":1}}   // missing secretKeys
+getSummary(ref)  →  TypeError: entry.secretKeys is not iterable   ← throws in a lock-free render path
+index = {"venue-x":42}
+getSummary(ref)  →  TypeError: Cannot convert undefined to object (Object.keys(entry.publicFields))
+hasCredentials(ref) → true    listProviders(ns) → ["venue-x"]     ← garbage reported as present
+```
+
+**Impact:** A fail-safe violation. `getSummary` throws (a `TypeError` can crash a badge/list render or be a minor DoS while the vault is *locked*), and `has`/`list`/`get` disagree — some report a corrupt entry as a present credential. Contradicts the audit's stated "probes report nothing, never throw" invariant. Reachable by the at-rest tamperer and by plain storage corruption; no secret disclosure.
+
+**Fix:** `readIndex` now validates **each entry's shape** (`publicFields` object, `secretKeys` array, numeric `updatedAt`, optional numeric `count`) and **drops** any that fail, copying survivors through a **null-prototype** accumulator (so a literal `"__proto__"` key from `JSON.parse` can't reach `Object.prototype` during the copy, and — with F-13 — a reserved-key entry is written as a safe own property). A corrupt entry now reads as "absent" — every probe agrees, none throws — exactly like a corrupt whole index. Arrays at the top level are also treated as unconfigured.
+
+**Regression tests:** `hardening — probe fail-safe on a malformed index ENTRY (F-11)` (11 tests: 9 malformed shapes × all-probes-agree-absent-and-never-throw, plus valid-sibling-survives and valid-entry-not-dropped).
+
+---
+
+### F-12 — A secret field could be sourced from the unauthenticated index · **Low · FIXED (defense-in-depth)**
+
+**Location:** `src/manager.ts` (`getCredentials`, single-schema merge).
+
+*Surfaced by the pass-3 re-audit.* The single-schema read merged `{ ...entry.publicFields, ...secrets }`. `secrets` (from the AEAD blob) is spread last, so it **overrides** any same-named index key — a populated secret is safe. But a schema-declared **secret** field that is **absent** from the blob (e.g. an unset optional secret) has no `secrets` entry to override an index-planted value, so an at-rest tamperer who writes that secret's name into the plaintext `publicFields` could **forge that field's value** in the object the app consumes.
+
+**Proof (pre-fix):**
+```
+schema: apiKey(secret,req), passphrase(secret,optional), walletAddress(public)
+set { apiKey:"real", walletAddress:"0xpub" }          // passphrase never set → not in blob
+tamper index.publicFields.passphrase = "ATTACKER"
+get(ref) → { apiKey:"real", walletAddress:"0xpub", passphrase:"ATTACKER" }   ← forged secret field
+```
+
+**Impact:** Integrity — the app could act on a "secret" value that never came through authenticated encryption. Never a *disclosure* of the victim's real secret; scoped to fields the blob doesn't hold. Rated Low (requires at-rest write access; the plaintext index was always tamperable for *non-secret* data by design).
+
+**Fix:** `getCredentials` now strips every schema-declared **secret** key from the index half before the merge, so a secret field can **only** ever be sourced from the authenticated blob. The legit write path never routes a secret into the index, so this is a **no-op for untampered data**; non-secret index fields are unaffected.
+
+**Regression tests:** `hardening — secret fields only ever come from the authenticated blob (F-12)` (3 tests: planted-optional-secret-not-returned, planted-value-for-populated-secret-loses-to-blob, non-secret-fields-still-flow).
+
+---
+
+### F-13 — Reserved object keys accepted as identifiers (silent data loss) · **Info · FIXED**
+
+**Location:** `src/manager.ts` (`assertSafeSegment`, `registerCredentialSchema`).
+
+*Surfaced by the pass-3 re-audit.* `blob[providerId]`, `index[providerId]`, and `secretFields[fieldKey]` are writes to **plain objects**. A `providerId` of `"__proto__"` makes `blob["__proto__"] = {…}` mutate the blob's *prototype* instead of adding an own property; `encryptBlob` then sees `Object.keys(blob).length === 0` and stores **nothing** — the credential is silently dropped (no persistence, no error). `constructor`/`prototype` are the same class of hazard. This is self-inflicted (an app choosing a pathological identifier), not a live pollution of `Object.prototype`, hence Info.
+
+**Fix:** `registerCredentialSchema` now rejects `__proto__`/`constructor`/`prototype` as a `namespace`, `providerId`, or field `key` (exact match) via `CredentialSchemaError` — a natural companion to the existing control-character rejection. Combined with F-11's null-prototype `readIndex` copy, the plain-object stores are well-defined for every accepted identifier.
+
+**Regression tests:** `hardening — reserved object keys rejected at registration (F-13)` (11 tests: 3 reserved keys × {namespace, providerId, field key}, no-Object.prototype-pollution, and exact-match-not-substring so `proto`/`constructorX`/`prototypeKey` still round-trip).
+
+---
+
 ### F-1 — Cache-key delimiter collision (theoretical) · **Low · FIXED (defense-in-depth)**
 ### F-2 — Account-switch prefix-keep leaves stale decrypted secrets · **Low · FIXED (defense-in-depth)**
 ### F-3 — Schema-registry key collision mis-routes a secret to plaintext · **Low · FIXED (defense-in-depth)**
@@ -213,6 +270,9 @@ These properties were tested adversarially and hold:
 | `src/session.ts` | Rewrote `SessionCache` to a nested `identity→namespace→providerId` `Map`; exact-key account eviction; deep-clone on read/write. | F-1, F-2, F-5 |
 | `src/manager.ts` | Injective `JSON.stringify` schema key; `assertSafeSegment` control-char rejection; empty-`multi` clears the provider + reads back `null`; per-namespace **clear-epoch** guard on `setCredentials`/`removeCredentials`/`getCredentials` + `encryptBlob`/`commitBlob` split; `listProviders`/`getSummary` skip `count:0` entries. | F-3, F-1/F-2, F-6, F-10 |
 | `src/crypto.ts` | Versioned, domain-separated KDF: `SHA-256(KDF_DOMAIN + appKey)`. | F-9 |
+| `src/storage.ts` | `readIndex` now validates each **entry's** shape and drops malformed ones, copying survivors through a **null-prototype** accumulator; top-level arrays treated as unconfigured. | F-11 |
+| `src/manager.ts` | `getCredentials` strips schema-declared **secret** keys from the plaintext-index half before the merge (secrets only from the AEAD blob); `assertSafeSegment` + field loop reject reserved object keys (`__proto__`/`constructor`/`prototype`). | F-12, F-13 |
+| `tests/tamper.test.ts` | **New** at-rest-tamperer suite — malformed-index-entry probe fail-safe (F-11), secret-only-from-blob (F-12), reserved-key rejection (F-13); 25 tests, negative-control-verified. | F-11/F-12/F-13 |
 | `src/manager.ts` | **Uniform async error handling:** `setCredentials`'s `requireSchema` moved inside the returned promise, so an unregistered ref now **rejects** rather than throwing synchronously — `set`/`get`/`remove` are all reject-only (a `.catch()` can no longer miss an error). | DX |
 | `tests/security.test.ts` | Adversarial suite — findings repro + at-rest crypto + isolation + KDF + empty-multi + concurrency (38 tests). | all |
 | `tests/errors.test.ts` | **New** dedicated error-handling & async-consistency suite — every `VaultLockedError`/`CredentialSchemaError`/`CredentialValidationError` path, sync-vs-async throw contract, malformed-schema branches, and adjacent edge use-cases. | DX |
@@ -229,11 +289,13 @@ No public API **signatures** changed (`clearNamespace` stays synchronous). One b
 ## 6. Test coverage
 
 ```
-Test Files  7 passed (7)
-     Tests  107 passed (107)    # 24 pre-existing + 83 new (hardening + error-handling + coverage)
+Test Files  8 passed (8)
+     Tests  132 passed (132)    # 24 pre-existing + 108 new (hardening + error-handling + coverage + pass-3 tamper)
 typecheck   clean (tsc --noEmit)
 guard       green (zero provider literals in src/ AND dist/; zero control bytes in src/)
 ```
+
+**Pass-3 methodology note:** the three pass-3 findings came from an independent re-audit centered on the **at-rest tamperer** (adversary #1) and ordinary storage corruption — the class of inputs the earlier fail-safe test only exercised at whole-index granularity, not per-entry. Each fix was **negative-control-verified**: with the fix reverted, 20/25 of the new `tamper.test.ts` cases fail; with it restored, all pass. The `tamper.test.ts` suite (25) brings the total to 132.
 
 Suites: `manager.test.ts` (round-trips, probes, validation), `session.test.ts` (B2 policy), `universality.test.ts` (runtime-schema + no-provider-literal guard over `src/`+`dist/` + control-byte check), `security.test.ts` (storage-key delimiter F-4, identifier hygiene & key injectivity F-1/F-2/F-3, session-cache reference hygiene F-5, identity isolation, at-rest crypto IV/AAD/wrong-key/tamper/version/truncation, KDF domain separation F-9, empty-multi consistency F-6, clearNamespace concurrency F-10, probe agreement on a stray `count:0` entry, storage fail-safe, base64 edge inputs, end-to-end confidentiality & fail-safe), `errors.test.ts` (uniform async rejection, every error type × condition, sync-vs-async throw contract, `.catch()` catchability), `blob.test.ts` (shared-namespace blob, populated-multi, write serialization, cache warming, clearNamespace breadth), and `env.test.ts` (runtime guards).
 
