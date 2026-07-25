@@ -5,6 +5,11 @@
   "type": "module",
   "sideEffects": false,
   "license": "MIT",
+  "homepage": "https://github.com/tetrac-official/tetrac-credentials-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tetrac-official/tetrac-credentials-sdk.git"
+  },
   "publishConfig": {
     "access": "public"
   },
