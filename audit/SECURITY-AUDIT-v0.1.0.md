@@ -31,8 +31,24 @@ The review found **no exploitable break of the encryption itself.** It did find 
 > `prototype` were accepted as a namespace/providerId/field key and would silently drop the
 > credential on write; now rejected at registration). Test suite **107 → 132**; each fix carries a
 > negative-control-verified regression test.
+>
+> **Update — hardening pass 4 → shipped in v0.1.1 (2026-07-25):** a further multi-agent adversarial
+> re-review (per-module review → independent skeptic verification) surfaced five more issues, all now
+> fixed in **v0.1.1**: (1) **readIndex fail-OPEN on an absent/corrupt index** — the null-prototype
+> guard from F-11 was only applied on the populated path, so a prototype-named `providerId`
+> (`"toString"`/`"valueOf"`/…) fell through to an inherited member, making `has()` report a phantom
+> credential and `getSummary`/`getCredentials` throw a `TypeError` (reachable with ordinary input, no
+> tampering); (2) **cross-identity cache leak** — a `set`/`get` whose account switched mid-crypto-await
+> filed (or returned) the previous account's plaintext under the new identity; writes are now bound to
+> the call-time account+key and cache writes are identity-guarded; (3) **read-after-write staleness** —
+> a `get` racing a committed `set` could re-warm the cache with the pre-write value (per-namespace
+> write-generation guard added); (4) **BOM data-loss** — `decryptString` stripped a leading U+FEFF
+> (`ignoreBOM`); (5) **count-validation divergence** — `isValidEntry` admitted a negative/NaN `count`
+> and `getSummary` disagreed with `has`/`list`. Test suite **132 → 162** (13 regression +
+> negative-control-verified where reproducible, 11 coverage-gap, 6 StorageLike-conformance); typecheck
+> clean; build + no-provider-literal guard green. **v0.1.1 fixes these issues and is ready to go.**
 
-**Verdict:** With all hardening applied, **v0.1.0 is approved** for its intended use (revocable, low-risk API credentials — never fund-custody keys). Test suite: **132/132 passing** (was 24), typecheck clean, no-provider-literal guard green (scans `dist/` too, with a silent-no-op guard), zero control bytes in `src/`.
+**Verdict:** With all hardening applied and the pass-4 fixes shipped, **v0.1.1 is approved** for its intended use (revocable, low-risk API credentials — never fund-custody keys). Test suite: **162/162 passing** (was 24), typecheck clean, no-provider-literal guard green (scans `dist/` too, with a silent-no-op guard), zero control bytes in `src/`.
 
 | Severity | Count | Fixed | Documented (no code change) |
 |----------|-------|-------|-----------------------------|
@@ -40,6 +56,10 @@ The review found **no exploitable break of the encryption itself.** It did find 
 | Medium   | 3     | 3 (F-4, F-5, F-10) | —              |
 | Low      | 6     | 6 (F-1, F-2, F-3, F-6, F-11, F-12) | —  |
 | Info     | 4     | 2 (F-9, F-13) | 2 (F-7 verified-satisfied, F-8 accepted) |
+
+> This table tallies the original F-1..F-13 findings. The **pass-4 re-review** later surfaced five
+> more (incl. two High-severity: the readIndex fail-open and the cross-identity cache leak) — all
+> fixed and shipped in **v0.1.1**; see the pass-4 note above.
 
 ---
 
